@@ -1,106 +1,91 @@
-import { Client, GatewayIntentBits, Collection } from 'discord.js';
-import { handleCryptoCommand } from './commands/crypto.js';
+import { readdir } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import express from 'express';
-import dotenv from 'dotenv';
-import fs from 'fs';
-import { REST } from '@discordjs/rest';
-import { Routes } from 'discord-api-types/v9';
-import path from 'path';
-import { fileURLToPath } from 'url';
+import { ActivityType, Client, Collection, Events, GatewayIntentBits } from 'discord.js';
+import { config, getRequiredEnv, validateEnvironment } from './config/config.js';
+import { handleCryptoCommand } from './commands/crypto.js';
 
-// Cargar las variables de entorno
-dotenv.config();
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const startedAt = Date.now();
+const cooldowns = new Map();
 
-// Crear cliente de Discord
+validateEnvironment();
+
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
 });
 
-// Crear una colección para los slash commands
 client.slashCommands = new Collection();
 
-// Obtener la ruta actual del archivo
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
-// Leer los archivos en la carpeta slashCommands
-const commandFiles = fs.readdirSync(path.join(__dirname, './slashCommands')).filter(file => file.endsWith('.js'));
-
-// Cargar todos los slash commands dinámicamente
-for (const file of commandFiles) {
-  const command = await import(`./slashCommands/${file}`);
-  client.slashCommands.set(command.data.name, command);
-}
-
-// Registro de comandos para cada nuevo servidor al que el bot sea invitado
-const rest = new REST({ version: '9' }).setToken(process.env.DISCORD_TOKEN);
-
-client.on('guildCreate', async guild => {
-  console.log(`Bot agregado al servidor: ${guild.name} (ID: ${guild.id})`);
-
-  const commands = client.slashCommands.map(command => command.data.toJSON());
-
-  try {
-    await rest.put(
-      Routes.applicationGuildCommands(process.env.CLIENT_ID, guild.id),
-      { body: commands },
-    );
-    console.log(`Comandos registrados para el servidor ${guild.name}`);
-  } catch (error) {
-    console.error(`Error al registrar comandos en el servidor ${guild.name}:`, error);
+const loadCommands = async () => {
+  const directory = join(__dirname, 'slashCommands');
+  const files = (await readdir(directory)).filter((file) => file.endsWith('.js'));
+  for (const file of files) {
+    const command = await import(pathToFileURL(join(directory, file)).href);
+    if (!command.data?.name || typeof command.execute !== 'function') {
+      throw new Error(`Invalid command module: ${file}`);
+    }
+    client.slashCommands.set(command.data.name, command);
   }
+};
+
+const cooldownRemaining = (interaction) => {
+  const key = `${interaction.user.id}:${interaction.commandName}`;
+  const remaining = config.commandCooldownMs - (Date.now() - (cooldowns.get(key) ?? 0));
+  if (remaining > 0) return Math.ceil(remaining / 1_000);
+  cooldowns.set(key, Date.now());
+  setTimeout(() => cooldowns.delete(key), config.commandCooldownMs).unref();
+  return 0;
+};
+
+client.once(Events.ClientReady, (readyClient) => {
+  readyClient.user.setActivity('/crypto · /compare', { type: ActivityType.Watching });
+  console.log(`Discord connected as ${readyClient.user.tag}. ${client.slashCommands.size} commands loaded.`);
 });
 
-// Evento cuando el bot está listo y conectado
-client.once('ready', () => {
-  console.log('Bot is online!');
-});
-
-// Evento para manejar slash commands
-client.on('interactionCreate', async interaction => {
-  if (!interaction.isCommand()) return;
-
+client.on(Events.InteractionCreate, async (interaction) => {
+  if (!interaction.isChatInputCommand()) return;
   const command = client.slashCommands.get(interaction.commandName);
-  
   if (!command) return;
-
-  try {
-    await command.execute(interaction);
-  } catch (error) {
-    console.error('Error al ejecutar comando:', error);
-    await interaction.reply({ content: 'Ocurrió un error al ejecutar el comando.', ephemeral: true });
+  const seconds = cooldownRemaining(interaction);
+  if (seconds > 0) {
+    await interaction.reply({ content: `Please wait ${seconds}s before using this command again.`, ephemeral: true });
+    return;
   }
+  await command.execute(interaction);
 });
 
-// Evento para manejar mensajes clásicos
-client.on('messageCreate', async (message) => {
+client.on(Events.MessageCreate, async (message) => {
   if (message.author.bot) return;
-  if (message.content.startsWith('!crypto')) {
-    await handleCryptoCommand(message);
-  }
+  if (message.content.toLowerCase().startsWith(`${config.prefix}crypto`)) await handleCryptoCommand(message);
 });
 
-// Evento para manejar reconexiones automáticas
-client.on('reconnecting', () => {
-  console.log('Bot is reconnecting to Discord...');
-});
+client.on(Events.Error, (error) => console.error('[discord:error]', error));
+client.on(Events.Warn, (warning) => console.warn('[discord:warning]', warning));
 
-// Evento para manejar desconexiones
-client.on('disconnect', (event) => {
-  console.log(`Bot disconnected with code ${event.code}. Attempting to reconnect...`);
-  client.login(process.env.DISCORD_TOKEN);
-});
-
-// Evento para manejar errores
-client.on('error', (error) => {
-  console.error('An error occurred:', error);
-});
-
-// Iniciar sesión en Discord
-client.login(process.env.DISCORD_TOKEN);
-
-// Configuración del servidor Express
 const app = express();
-const PORT = process.env.PORT || 5000;
+app.disable('x-powered-by');
+app.get('/', (_request, response) => response.json({
+  service: 'Crypto Pulse Discord Bot',
+  status: client.isReady() ? 'online' : 'starting',
+}));
+app.get('/health', (_request, response) => response.status(client.isReady() ? 200 : 503).json({
+  status: client.isReady() ? 'healthy' : 'starting',
+  discord: client.isReady() ? 'connected' : 'disconnected',
+  uptimeSeconds: Math.floor((Date.now() - startedAt) / 1_000),
+  commands: client.slashCommands.size,
+}));
 
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+const shutdown = (signal) => {
+  console.log(`${signal} received. Closing Discord connection.`);
+  client.destroy();
+  process.exit(0);
+};
+
+process.once('SIGINT', () => shutdown('SIGINT'));
+process.once('SIGTERM', () => shutdown('SIGTERM'));
+
+await loadCommands();
+app.listen(config.port, () => console.log(`Health server listening on port ${config.port}.`));
+await client.login(getRequiredEnv('DISCORD_TOKEN'));

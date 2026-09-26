@@ -1,50 +1,24 @@
-import { REST } from '@discordjs/rest';
-import { Routes } from 'discord-api-types/v9';
-import fs from 'fs';
-import dotenv from 'dotenv';
+import { readdir } from 'node:fs/promises';
+import { resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { REST, Routes } from 'discord.js';
+import { getRequiredEnv } from './src/config/config.js';
 
-// Cargar las variables de entorno desde el archivo .env
-dotenv.config();
-
-// Variables necesarias
-const clientId = process.env.CLIENT_ID;
-const token = process.env.DISCORD_TOKEN;
-const guildId = process.env.GUILD_ID; // Esto es opcional para probar en un servidor específico
-
-// Crear array de comandos
+const directory = resolve('src/slashCommands');
+const files = (await readdir(directory)).filter((file) => file.endsWith('.js'));
 const commands = [];
 
-// Leer los archivos de comandos desde la carpeta slashCommands
-const commandFiles = fs.readdirSync('./src/slashCommands').filter(file => file.endsWith('.js'));
-
-for (const file of commandFiles) {
-  const command = await import(`./src/slashCommands/${file}`);
+for (const file of files) {
+  const command = await import(pathToFileURL(resolve(directory, file)).href);
   commands.push(command.data.toJSON());
 }
 
-// Crear una instancia de REST para registrar los comandos
-const rest = new REST({ version: '9' }).setToken(token);
+const clientId = getRequiredEnv('CLIENT_ID');
+const token = getRequiredEnv('DISCORD_TOKEN');
+const guildId = process.env.GUILD_ID?.trim();
+const route = guildId ? Routes.applicationGuildCommands(clientId, guildId) : Routes.applicationCommands(clientId);
+const rest = new REST({ version: '10' }).setToken(token);
 
-(async () => {
-  try {
-    console.log('Empezando a registrar slash commands.');
-
-    // Si se proporciona un guildId, registrar los comandos en el servidor específico
-    if (guildId) {
-      await rest.put(
-        Routes.applicationGuildCommands(clientId, guildId),
-        { body: commands },
-      );
-      console.log('Comandos registrados en el servidor especificado.');
-    } else {
-      // Si no hay guildId, registrar globalmente
-      await rest.put(
-        Routes.applicationCommands(clientId),
-        { body: commands },
-      );
-      console.log('Comandos registrados globalmente.');
-    }
-  } catch (error) {
-    console.error(error);
-  }
-})();
+console.log(`Registering ${commands.length} commands ${guildId ? `for guild ${guildId}` : 'globally'}...`);
+await rest.put(route, { body: commands });
+console.log('Discord commands registered successfully.');
